@@ -2,6 +2,54 @@
 #' @importFrom Rcpp sourceCpp
 NULL
 
+
+mtlr_step <- function(
+  x,
+  y_matrix,
+  censInd,
+  time_points,
+  C1=1,
+  seed_weights = NULL,
+  train_biases = F,
+  train_uncensored = F,
+  it_step = 250,
+  threshold_factor = 1e-05,
+  lower = -15,
+  upper = 15
+) {
+  if(is.null(seed_weights)){
+    if(train_biases){
+      zero_matrix <- matrix(0, ncol = ncol(x), nrow = nrow(x))   #We create a zero_matrix to train the biases
+      
+      bias_par <- stats::optim(par = rep(0,length(time_points)*(ncol(x) +1)),fn = mtlr_objVal,gr = mtlr_grad, yval = y_matrix,
+                               featureValue = zero_matrix, C1=C1, delta = rep(1,nrow(x)),
+                               method = "L-BFGS-B", lower = lower, upper = upper, control = c(maxit = it_step, factr = threshold_factor))
+      if(bias_par$convergence == 52)
+        stop(paste("Error occured while training MTLR. Optim Error: ", bias_par$message))
+    }else{
+      bias_par <- list(par = rep(0,length(time_points)*(ncol(x) +1)))
+    }
+    if(train_uncensored){
+      params_uncensored <- stats::optim(par = bias_par$par,fn = mtlr_objVal, gr = mtlr_grad, yval = y_matrix, featureValue = x, C1 = C1, delta = rep(1,nrow(x)),
+                                        method = "L-BFGS-B", lower = lower, upper = upper, control = c(maxit = it_step, factr = threshold_factor))
+      if(params_uncensored$convergence == 52)
+        stop(paste("Error occured while training MTLR. Optim Error: ", params_uncensored$message))
+    }else{
+      params_uncensored = bias_par
+    }
+    
+    final_params <- stats::optim(par = params_uncensored$par,fn = mtlr_objVal,gr = mtlr_grad, yval = y_matrix, featureValue = x, C1 = C1,delta = sort(censInd),
+                                 method = "L-BFGS-B", lower = lower, upper = upper, control = c(maxit = it_step, factr = threshold_factor))
+    if(final_params$convergence == 52)
+      stop(paste("Error occured while training MTLR. Optim Error: ", final_params$message))
+  } else{
+    final_params <- stats::optim(par = seed_weights,fn = mtlr_objVal,gr = mtlr_grad, yval = y_matrix, featureValue = x, C1 = C1,delta = sort(censInd),
+                                 method = "L-BFGS-B", lower = lower, upper = upper, control = c(maxit = it_step, factr = threshold_factor))
+  }
+  
+  return(final_params)
+}
+
 #' Train a Multi-Task Logistic Regression (MTLR) Model
 #'
 #' Trains a MTLR model for survival prediction. Right, left, and interval censored data are all supported.
@@ -111,7 +159,8 @@ mtlr <- function(formula,
                  threshold = 1e-05,
                  maxit = 5000,
                  lower = -15,
-                 upper = 15){
+                 upper = 15,
+                 it_step = NULL){
   cl <- match.call() #Save a copy of the function call.
   if(any(dim(data)==0)){
     stop("Dimensions of the dataset must be non-zero.")
@@ -192,8 +241,6 @@ mtlr <- function(formula,
   if(!is.numeric(time_points))
     stop("time_points must be a numeric vector")
 
-
-
   time_points <- time_points[!duplicated(time_points)]#Small data (or common event times) we will have duplicated time points -- we remove them.
 
   #We make a matrix where each column is a vector of indicators if an observation is dead at each time point, e.g. (0,0,,...,0,1,1,...1).
@@ -227,38 +274,36 @@ mtlr <- function(formula,
   #train the data with their true censor statuses.
   threshold_factor <- threshold/.Machine$double.eps
   censInd = ifelse(delta <1,0,1)
-  if(is.null(seed_weights)){
-    if(train_biases){
-      zero_matrix <- matrix(0,ncol = ncol(x), nrow = nrow(x))   #We create a zero_matrix to train the biases
-
-      bias_par <- stats::optim(par = rep(0,length(time_points)*(ncol(x) +1)),fn = mtlr_objVal,gr = mtlr_grad, yval = y_matrix,
-                               featureValue = zero_matrix, C1=C1, delta = rep(1,nrow(x)),
-                               method = "L-BFGS-B", lower = lower, upper = upper, control = c(maxit = maxit, factr = threshold_factor))
-      if(bias_par$convergence == 52)
-        stop(paste("Error occured while training MTLR. Optim Error: ", bias_par$message))
-    }else{
-      bias_par <- list(par = rep(0,length(time_points)*(ncol(x) +1)))
+  
+  if (is.null(it_step))
+    init_step <- maxit
+  else
+    init_step <- 1
+  
+  params <- mtlr_step(
+    x, y_matrix, censInd, time_points,
+    C1 = C1, seed_weights = seed_weights, train_biases = train_biases,
+    train_uncensored = train_uncensored,
+    it_step = init_step, threshold_factor = threshold_factor,
+    lower = lower, upper = upper
+  )
+  weights <- matrix(params$par, ncol = ncol(x) + 1, byrow=FALSE)
+  
+  loss <- c(params$value)
+  if (!is.null(it_step)) {
+    for (i in (1:as.integer(maxit/it_step))) {
+      params <- mtlr_step(
+        x, y_matrix, censInd, time_points,
+        C1 = C1, seed_weights = weights, train_biases = train_biases,
+        train_uncensored = train_uncensored,
+        it_step = it_step, threshold_factor = threshold_factor,
+        lower = lower, upper = upper
+      )
+      weights <- matrix(params$par, ncol = ncol(x) + 1, byrow=FALSE)
+      loss <- c(loss, params$value)
     }
-    if(train_uncensored){
-      params_uncensored <- stats::optim(par = bias_par$par,fn = mtlr_objVal, gr = mtlr_grad, yval = y_matrix, featureValue = x, C1 = C1, delta = rep(1,nrow(x)),
-                                        method = "L-BFGS-B", lower = lower, upper = upper, control = c(maxit = maxit, factr = threshold_factor))
-      if(params_uncensored$convergence == 52)
-      stop(paste("Error occured while training MTLR. Optim Error: ", params_uncensored$message))
-    }else{
-      params_uncensored = bias_par
-    }
-
-    final_params <- stats::optim(par = params_uncensored$par,fn = mtlr_objVal,gr = mtlr_grad, yval = y_matrix, featureValue = x, C1 = C1,delta = sort(censInd),
-                                 method = "L-BFGS-B", lower = lower, upper = upper, control = c(maxit = maxit, factr = threshold_factor))
-    if(final_params$convergence == 52)
-      stop(paste("Error occured while training MTLR. Optim Error: ", final_params$message))
-  } else{
-    final_params <- stats::optim(par = seed_weights,fn = mtlr_objVal,gr = mtlr_grad, yval = y_matrix, featureValue = x, C1 = C1,delta = sort(censInd),
-                                 method = "L-BFGS-B", lower = lower, upper = upper, control = c(maxit = maxit, factr = threshold_factor))
   }
-
-
-  weights <- matrix(final_params$par, ncol = ncol(x) + 1,byrow=FALSE)
+  
   colnames(weights) <- c("Bias",colnames(x))
   rownames(weights) <- round(time_points,2)
   x <- x[order(ord),0:ncol(x),drop = FALSE]
@@ -272,9 +317,10 @@ mtlr <- function(formula,
               Call = cl,
               Terms = Terms,
               scale = scales,
-              xlevels = xlevels)
+              xlevels = xlevels,
+              loss = loss)
   class(fit) <- "mtlr"
-  fit
+  return(fit)
 }
 
 
